@@ -25,7 +25,7 @@ const client = new Client({
   // pairing code
   login: {
     method: "pair",
-    number: "966569688912",
+    number: "201503107284",
     code: "REZE1234",
   },
 

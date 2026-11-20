@@ -1,11 +1,7 @@
+const DEFAULT_PORT = 24599;
+const PAIRING_TIMEOUT_MS = 60000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-export async function startApi(client, subs) {
-  const app = await client.server({ port: 24599 });
-
-  // الصفحة الرئيسية
-  app.get("/", (c) => c.html("<!DOCTYPE html>
+const HTML_PAGE = `<!DOCTYPE html>
 <html lang="ar">
 
 <head>
@@ -209,7 +205,7 @@ export async function startApi(client, subs) {
   </footer>
 
   <script>
-    const API_BASE = "/api";
+    const API_BASE = window.location.origin + "/api";
 
     const numInput = document.getElementById("num");
     const submitBtn = document.getElementById("submitBtn");
@@ -320,7 +316,7 @@ export async function startApi(client, subs) {
       isFetchingCount = true;
       try {
         const { ok, data } = await fetchJson(
-          `${API_BASE}/count?t=${Date.now()}&r=${Math.random()}`,
+          API_BASE + "/count?t=" + Date.now() + "&r=" + Math.random(),
           8000
         );
         if (ok && data && typeof data.count !== "undefined") {
@@ -335,7 +331,7 @@ export async function startApi(client, subs) {
 
     async function checkStatus(number, signal = null) {
       const { ok, data } = await fetchJson(
-        `${API_BASE}/status?number=${encodeURIComponent(number)}&t=${Date.now()}&r=${Math.random()}`,
+        API_BASE + "/status?number=" + encodeURIComponent(number) + "&t=" + Date.now() + "&r=" + Math.random(),
         8000,
         signal
       );
@@ -347,7 +343,7 @@ export async function startApi(client, subs) {
 
     async function requestAdded(number, signal = null) {
       return fetchJson(
-        `${API_BASE}/added?number=${encodeURIComponent(number)}&t=${Date.now()}&r=${Math.random()}`,
+        API_BASE + "/added?number=" + encodeURIComponent(number) + "&t=" + Date.now() + "&r=" + Math.random(),
         25000,
         signal
       );
@@ -402,7 +398,7 @@ export async function startApi(client, subs) {
     async function handleSubmit() {
       if (isRequesting) return;
 
-      const number = numInput.value.replace(/\D/g, "");
+      const number = numInput.value.replace(/[^0-9]/g, "");
       if (!number || number.length < 8) {
         hideCode();
         showMsg("اكتب رقم صحيح بكود الدولة", "error");
@@ -487,71 +483,194 @@ export async function startApi(client, subs) {
   </script>
 </body>
 
-</html>
-"));
+</html>`;
 
-  // إنشاء بوت جديد
+const pendingSessions = new Map();
+
+function getServerPort() {
+  return Number(
+    process.env.SERVER_PORT ||
+    process.env.PORT ||
+    process.env.APP_PORT ||
+    DEFAULT_PORT
+  );
+}
+
+async function resolveBaseUrl(port) {
+  if (process.env.PUBLIC_URL) {
+    return process.env.PUBLIC_URL.replace(/\/+$/, "");
+  }
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL.replace(/\/+$/, "");
+  }
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    return "https://" + process.env.RAILWAY_PUBLIC_DOMAIN;
+  }
+  if (process.env.KOYEB_PUBLIC_DOMAIN) {
+    return "https://" + process.env.KOYEB_PUBLIC_DOMAIN;
+  }
+  if (process.env.REPLIT_DEV_DOMAIN) {
+    return "https://" + process.env.REPLIT_DEV_DOMAIN;
+  }
+  if (process.env.PROJECT_DOMAIN) {
+    return "https://" + process.env.PROJECT_DOMAIN + ".glitch.me";
+  }
+  if (process.env.FLY_APP_NAME) {
+    return "https://" + process.env.FLY_APP_NAME + ".fly.dev";
+  }
+  if (process.env.SERVER_IP && process.env.SERVER_IP !== "0.0.0.0") {
+    return `http://${process.env.SERVER_IP}:${port}`;
+  }
+
+  try {
+    const res = await fetch("https://api.ipify.org?format=json");
+    const data = await res.json();
+    if (data && data.ip) {
+      return `http://${data.ip}:${port}`;
+    }
+  } catch (e) {
+  }
+
+  return `http://localhost:${port}`;
+}
+
+export async function startApi(client, subs) {
+  const port = getServerPort();
+  let baseUrl = await resolveBaseUrl(port);
+  const app = await client.server({ port });
+
+  function syncBaseUrl(c) {
+    try {
+      if (!c.req || typeof c.req.header !== "function") return;
+      const host = c.req.header("x-forwarded-host") || c.req.header("host");
+      if (host && !host.startsWith("localhost") && !host.startsWith("127.0.0.1")) {
+        const proto = c.req.header("x-forwarded-proto") || "http";
+        baseUrl = `${proto}://${host}`;
+      }
+    } catch (e) {
+    }
+  }
+
+  if (typeof app.use === "function") {
+    app.use("*", async (c, next) => {
+      syncBaseUrl(c);
+      await next();
+    });
+  }
+
+  app.get("/", (c) => {
+    syncBaseUrl(c);
+    return c.html(HTML_PAGE);
+  });
+
+  app.get("/api/info", (c) => {
+    syncBaseUrl(c);
+    c.header("Cache-Control", "no-store");
+    return c.json({
+      port,
+      site: baseUrl,
+      api: `${baseUrl}/api`
+    });
+  });
+
   app.get("/api/added", async (c) => {
+    syncBaseUrl(c);
+    c.header("Cache-Control", "no-store");
     const number = c.req.query("number");
 
     if (!number)
       return c.json({ success: false, error: "ex: ?number=20123456789" }, 400);
+
+    if (subs.get(number)?.connected) {
+      if (pendingSessions.has(number)) {
+        clearTimeout(pendingSessions.get(number).timer);
+        pendingSessions.delete(number);
+      }
+      return c.json({
+        success: false,
+        number,
+        connected: true,
+        status: "connected",
+        error: "Already connected"
+      }, 409);
+    }
+
+    if (pendingSessions.has(number)) {
+      return c.json({
+        success: false,
+        number,
+        code: pendingSessions.get(number).code,
+        connected: false,
+        status: "pending",
+        error: "Session already open"
+      }, 409);
+    }
 
     const code = await subs.addBot(number);
 
     if (!code)
       return c.json({ success: false, error: "Failed to create pairing code" }, 500);
 
-    for (let i = 0; i < 19; i++) {
-      await sleep(1000);
-
-      if (subs.get(number)?.connected) {
-        return c.json({
-          success: true,
-          number,
-          code,
-          connected: true,
-          status: "connected"
-        });
+    const timer = setTimeout(async () => {
+      pendingSessions.delete(number);
+      if (!subs.get(number)?.connected) {
+        await subs.remove(number);
       }
-    }
+    }, PAIRING_TIMEOUT_MS);
 
-    if (!subs.get(number)?.connected) {
-      await subs.remove(number);
+    pendingSessions.set(number, { code, timer });
 
-      return c.json({
-        success: false,
-        number,
-        code: null,
-        connected: false,
-        error: "Pairing timeout"
-      }, 408);
-    }
+    return c.json({
+      success: true,
+      number,
+      code,
+      connected: false,
+      status: "pending"
+    });
   });
 
-  // عدد البوتات
   app.get("/api/count", async (c) => {
+    syncBaseUrl(c);
+    c.header("Cache-Control", "no-store");
     return c.json({
       count: subs.list().length
     });
   });
 
-  // حالة اتصال البوت
   app.get("/api/status", async (c) => {
+    syncBaseUrl(c);
+    c.header("Cache-Control", "no-store");
     const number = c.req.query("number");
 
     if (!number)
       return c.json({ success: false, error: "Number is required" }, 400);
 
     const bot = subs.get(number);
+    const connected = Boolean(bot?.connected);
+
+    if (connected && pendingSessions.has(number)) {
+      clearTimeout(pendingSessions.get(number).timer);
+      pendingSessions.delete(number);
+    }
 
     return c.json({
       success: true,
       number,
-      connected: Boolean(bot?.connected),
-      status: bot?.connected ? "connected" : "not_connected"
+      connected,
+      status: connected ? "connected" : "not_connected"
     });
   });
+
+  app.port = port;
+  app.getSiteUrl = () => baseUrl;
+  app.getApiUrl = () => `${baseUrl}/api`;
+
+  console.log("========================================");
+  console.log("Reze Sub Server Running");
+  console.log("Port :", port);
+  console.log("Site :", baseUrl);
+  console.log("API  :", `${baseUrl}/api`);
+  console.log("========================================");
 
   return app;
 }
